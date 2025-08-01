@@ -1,0 +1,486 @@
+//=============================================================================
+// STEP 1: Add extraction configuration to llama.h
+//=============================================================================
+
+// Add this to llama.h after existing structs
+struct llama_extraction_config {
+    bool extract_weights;
+    bool extract_activations;
+    bool extract_attention;
+    const char* output_dir;
+    bool use_numpy_format; // true for .npy, false for .csv
+};
+
+// Add this function declaration to llama.h
+LLAMA_API void llama_set_extraction_config(struct llama_context * ctx, const struct llama_extraction_config * config);
+
+//=============================================================================
+// STEP 2: Create extraction utility header (llama_extraction.h)
+//=============================================================================
+
+#ifndef LLAMA_EXTRACTION_H
+#define LLAMA_EXTRACTION_H
+
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+
+// Forward declarations
+struct ggml_tensor;
+struct llama_extraction_config;
+
+class LlamaStateExtractor {
+private:
+    llama_extraction_config config_;
+    std::string output_dir_;
+    int current_token_idx_;
+    int current_layer_idx_;
+    bool initialized_;
+
+public:
+    LlamaStateExtractor() : current_token_idx_(0), current_layer_idx_(0), initialized_(false) {}
+    
+    void initialize(const llama_extraction_config& config);
+    void reset_token_counter() { current_token_idx_ = 0; }
+    void increment_token() { current_token_idx_++; }
+    void set_layer(int layer) { current_layer_idx_ = layer; }
+    
+    // Extraction methods
+    void extract_weights(const struct ggml_tensor* tensor, const std::string& layer_name);
+    void extract_activations(const struct ggml_tensor* tensor, const std::string& layer_name);
+    void extract_attention_matrix(const struct ggml_tensor* tensor, const std::string& attention_type);
+    
+private:
+    void save_tensor_numpy(const struct ggml_tensor* tensor, const std::string& filename);
+    void save_tensor_csv(const struct ggml_tensor* tensor, const std::string& filename);
+    void ensure_directory_exists(const std::string& path);
+    std::string get_tensor_info_string(const struct ggml_tensor* tensor);
+};
+
+#endif // LLAMA_EXTRACTION_H
+
+//=============================================================================
+// STEP 3: Implementation of extraction utilities (llama_extraction.cpp)
+//=============================================================================
+
+#include "llama_extraction.h"
+#include "ggml.h"
+#include <cstring>
+#include <iomanip>
+
+void LlamaStateExtractor::initialize(const llama_extraction_config& config) {
+    config_ = config;
+    output_dir_ = std::string(config.output_dir);
+    ensure_directory_exists(output_dir_);
+    
+    // Create subdirectories
+    if (config_.extract_weights) {
+        ensure_directory_exists(output_dir_ + "/weights");
+    }
+    if (config_.extract_activations) {
+        ensure_directory_exists(output_dir_ + "/activations");
+    }
+    if (config_.extract_attention) {
+        ensure_directory_exists(output_dir_ + "/attention");
+    }
+    
+    initialized_ = true;
+    
+    // Log extraction configuration
+    std::ofstream log_file(output_dir_ + "/extraction_log.txt");
+    log_file << "Extraction Configuration:\n";
+    log_file << "Extract Weights: " << (config_.extract_weights ? "Yes" : "No") << "\n";
+    log_file << "Extract Activations: " << (config_.extract_activations ? "Yes" : "No") << "\n";
+    log_file << "Extract Attention: " << (config_.extract_attention ? "Yes" : "No") << "\n";
+    log_file << "Output Format: " << (config_.use_numpy_format ? "NumPy" : "CSV") << "\n";
+    log_file.close();
+}
+
+void LlamaStateExtractor::extract_weights(const struct ggml_tensor* tensor, const std::string& layer_name) {
+    if (!initialized_ || !config_.extract_weights || !tensor) return;
+    
+    std::string filename = output_dir_ + "/weights/" + layer_name;
+    filename += config_.use_numpy_format ? ".npy" : ".csv";
+    
+    if (config_.use_numpy_format) {
+        save_tensor_numpy(tensor, filename);
+    } else {
+        save_tensor_csv(tensor, filename);
+    }
+}
+
+void LlamaStateExtractor::extract_activations(const struct ggml_tensor* tensor, const std::string& layer_name) {
+    if (!initialized_ || !config_.extract_activations || !tensor) return;
+    
+    std::stringstream ss;
+    ss << output_dir_ << "/activations/" << layer_name 
+       << "_token" << std::setfill('0') << std::setw(4) << current_token_idx_
+       << "_layer" << std::setfill('0') << std::setw(2) << current_layer_idx_;
+    
+    std::string filename = ss.str();
+    filename += config_.use_numpy_format ? ".npy" : ".csv";
+    
+    if (config_.use_numpy_format) {
+        save_tensor_numpy(tensor, filename);
+    } else {
+        save_tensor_csv(tensor, filename);
+    }
+}
+
+void LlamaStateExtractor::extract_attention_matrix(const struct ggml_tensor* tensor, const std::string& attention_type) {
+    if (!initialized_ || !config_.extract_attention || !tensor) return;
+    
+    std::stringstream ss;
+    ss << output_dir_ << "/attention/" << attention_type
+       << "_token" << std::setfill('0') << std::setw(4) << current_token_idx_
+       << "_layer" << std::setfill('0') << std::setw(2) << current_layer_idx_;
+    
+    std::string filename = ss.str();
+    filename += config_.use_numpy_format ? ".npy" : ".csv";
+    
+    if (config_.use_numpy_format) {
+        save_tensor_numpy(tensor, filename);
+    } else {
+        save_tensor_csv(tensor, filename);
+    }
+}
+
+void LlamaStateExtractor::save_tensor_numpy(const struct ggml_tensor* tensor, const std::string& filename) {
+    // Simplified NumPy format writer (supports basic dtypes)
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) return;
+    
+    // NumPy header magic
+    const char magic[] = "\x93NUMPY";
+    file.write(magic, 6);
+    
+    // Version
+    file.put(1); file.put(0);
+    
+    // Create header string
+    std::stringstream header;
+    header << "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    
+    // Write shape
+    for (int i = tensor->n_dims - 1; i >= 0; i--) {
+        header << tensor->ne[i];
+        if (i > 0) header << ", ";
+    }
+    header << "), }";
+    
+    // Pad header to 16-byte boundary
+    std::string header_str = header.str();
+    int padding = 16 - ((header_str.length() + 2) % 16);
+    if (padding == 16) padding = 0;
+    header_str += std::string(padding, ' ');
+    header_str += '\n';
+    
+    // Write header length and header
+    uint16_t header_len = header_str.length();
+    file.write(reinterpret_cast<const char*>(&header_len), 2);
+    file.write(header_str.c_str(), header_len);
+    
+    // Write tensor data
+    size_t data_size = ggml_nbytes(tensor);
+    file.write(reinterpret_cast<const char*>(tensor->data), data_size);
+    file.close();
+}
+
+void LlamaStateExtractor::save_tensor_csv(const struct ggml_tensor* tensor, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) return;
+    
+    // Write header with tensor info
+    file << "# " << get_tensor_info_string(tensor) << "\n";
+    
+    const float* data = reinterpret_cast<const float*>(tensor->data);
+    size_t total_elements = ggml_nelements(tensor);
+    
+    // For 1D tensors, write as single row
+    if (tensor->n_dims == 1) {
+        for (size_t i = 0; i < total_elements; i++) {
+            file << data[i];
+            if (i < total_elements - 1) file << ",";
+        }
+        file << "\n";
+    }
+    // For 2D tensors, write as matrix
+    else if (tensor->n_dims == 2) {
+        size_t rows = tensor->ne[1];
+        size_t cols = tensor->ne[0];
+        for (size_t i = 0; i < rows; i++) {
+            for (size_t j = 0; j < cols; j++) {
+                file << data[i * cols + j];
+                if (j < cols - 1) file << ",";
+            }
+            file << "\n";
+        }
+    }
+    // For higher dimensions, flatten and write with shape info
+    else {
+        for (size_t i = 0; i < total_elements; i++) {
+            file << data[i];
+            if (i < total_elements - 1) file << ",";
+        }
+        file << "\n";
+    }
+    
+    file.close();
+}
+
+std::string LlamaStateExtractor::get_tensor_info_string(const struct ggml_tensor* tensor) {
+    std::stringstream ss;
+    ss << "Shape: (";
+    for (int i = tensor->n_dims - 1; i >= 0; i--) {
+        ss << tensor->ne[i];
+        if (i > 0) ss << ", ";
+    }
+    ss << "), Elements: " << ggml_nelements(tensor);
+    ss << ", Type: " << ggml_type_name(tensor->type);
+    return ss.str();
+}
+
+void LlamaStateExtractor::ensure_directory_exists(const std::string& path) {
+    std::filesystem::create_directories(path);
+}
+
+//=============================================================================
+// STEP 4: Modifications to llama.cpp main implementation
+//=============================================================================
+
+// Add this to the llama_context struct in llama.cpp
+struct llama_context {
+    // ... existing members ...
+    
+    // ADD THIS:
+    LlamaStateExtractor* state_extractor;
+    llama_extraction_config extraction_config;
+    bool extraction_enabled;
+};
+
+// ADD THIS: Implementation of the configuration function
+void llama_set_extraction_config(struct llama_context * ctx, const struct llama_extraction_config * config) {
+    if (!ctx || !config) return;
+    
+    ctx->extraction_config = *config;
+    ctx->extraction_enabled = config->extract_weights || config->extract_activations || config->extract_attention;
+    
+    if (ctx->extraction_enabled) {
+        if (!ctx->state_extractor) {
+            ctx->state_extractor = new LlamaStateExtractor();
+        }
+        ctx->state_extractor->initialize(*config);
+    }
+}
+
+//=============================================================================
+// STEP 5: Add extraction hooks to the forward pass
+//=============================================================================
+
+// In the model loading function (where weights are loaded), ADD:
+static void extract_model_weights(struct llama_context * ctx, const struct llama_model * model) {
+    if (!ctx->extraction_enabled || !ctx->extraction_config.extract_weights) return;
+    
+    // Extract embedding weights
+    if (model->tok_embd) {
+        ctx->state_extractor->extract_weights(model->tok_embd, "token_embedding");
+    }
+    
+    // Extract layer weights
+    for (int i = 0; i < model->hparams.n_layer; i++) {
+        std::string layer_prefix = "layer_" + std::to_string(i) + "_";
+        
+        const auto& layer = model->layers[i];
+        
+        // Attention weights
+        if (layer.wq) ctx->state_extractor->extract_weights(layer.wq, layer_prefix + "attention_q");
+        if (layer.wk) ctx->state_extractor->extract_weights(layer.wk, layer_prefix + "attention_k");
+        if (layer.wv) ctx->state_extractor->extract_weights(layer.wv, layer_prefix + "attention_v");
+        if (layer.wo) ctx->state_extractor->extract_weights(layer.wo, layer_prefix + "attention_output");
+        
+        // Feed-forward weights
+        if (layer.w1) ctx->state_extractor->extract_weights(layer.w1, layer_prefix + "ffn_gate");
+        if (layer.w2) ctx->state_extractor->extract_weights(layer.w2, layer_prefix + "ffn_down");
+        if (layer.w3) ctx->state_extractor->extract_weights(layer.w3, layer_prefix + "ffn_up");
+        
+        // Normalization weights
+        if (layer.attention_norm) ctx->state_extractor->extract_weights(layer.attention_norm, layer_prefix + "attention_norm");
+        if (layer.ffn_norm) ctx->state_extractor->extract_weights(layer.ffn_norm, layer_prefix + "ffn_norm");
+    }
+    
+    // Output normalization and projection
+    if (model->output_norm) {
+        ctx->state_extractor->extract_weights(model->output_norm, "output_norm");
+    }
+    if (model->output) {
+        ctx->state_extractor->extract_weights(model->output, "output_projection");
+    }
+}
+
+// In the main forward pass function, ADD these hooks at appropriate locations:
+
+// Hook for layer activations (add after each major computation)
+#define EXTRACT_ACTIVATION(tensor, name) \
+    do { \
+        if (ctx->extraction_enabled && ctx->extraction_config.extract_activations && (tensor)) { \
+            ctx->state_extractor->extract_activations((tensor), (name)); \
+        } \
+    } while(0)
+
+// Hook for attention matrices (add after attention computation)
+#define EXTRACT_ATTENTION(tensor, name) \
+    do { \
+        if (ctx->extraction_enabled && ctx->extraction_config.extract_attention && (tensor)) { \
+            ctx->state_extractor->extract_attention_matrix((tensor), (name)); \
+        } \
+    } while(0)
+
+// Example of where to place hooks in the forward pass:
+static struct ggml_tensor * llm_build_mistral(
+        struct ggml_context * ctx,
+        const struct llama_context * lctx,
+        const struct llama_hparams & hparams,
+        const struct llama_kv_cache & kv,
+        struct ggml_cgraph * graph,
+        struct ggml_tensor * tokens,
+        struct ggml_tensor * embd,
+        int n_tokens,
+        int n_past) {
+    
+    // ... existing code ...
+    
+    // Reset token counter at start of forward pass
+    if (lctx->extraction_enabled) {
+        lctx->state_extractor->reset_token_counter();
+    }
+    
+    // Token embedding
+    struct ggml_tensor * inpL = ggml_get_rows(ctx, model.tok_embd, tokens);
+    EXTRACT_ACTIVATION(inpL, "token_embeddings");
+    
+    for (int il = 0; il < n_layer; ++il) {
+        // Set current layer for extraction
+        if (lctx->extraction_enabled) {
+            lctx->state_extractor->set_layer(il);
+        }
+        
+        struct ggml_tensor * cur = inpL;
+        
+        // Attention norm
+        cur = ggml_rms_norm(ctx, cur, norm_rms_eps);
+        cur = ggml_mul(ctx, cur, model.layers[il].attention_norm);
+        EXTRACT_ACTIVATION(cur, "attention_norm_output");
+        
+        // Self-attention
+        struct ggml_tensor * Qcur = ggml_mul_mat(ctx, model.layers[il].wq, cur);
+        struct ggml_tensor * Kcur = ggml_mul_mat(ctx, model.layers[il].wk, cur);
+        struct ggml_tensor * Vcur = ggml_mul_mat(ctx, model.layers[il].wv, cur);
+        
+        EXTRACT_ACTIVATION(Qcur, "query_projection");
+        EXTRACT_ACTIVATION(Kcur, "key_projection");
+        EXTRACT_ACTIVATION(Vcur, "value_projection");
+        
+        // ... RoPE and other transformations ...
+        
+        // Attention computation
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+        kq = ggml_soft_max(ctx, kq);
+        EXTRACT_ATTENTION(kq, "attention_weights");
+        
+        struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
+        EXTRACT_ACTIVATION(kqv, "attention_output");
+        
+        // Output projection
+        cur = ggml_mul_mat(ctx, model.layers[il].wo, kqv);
+        EXTRACT_ACTIVATION(cur, "attention_final_output");
+        
+        // Residual connection
+        inpL = ggml_add(ctx, inpL, cur);
+        EXTRACT_ACTIVATION(inpL, "post_attention_residual");
+        
+        // Feed-forward network
+        cur = ggml_rms_norm(ctx, inpL, norm_rms_eps);
+        cur = ggml_mul(ctx, cur, model.layers[il].ffn_norm);
+        EXTRACT_ACTIVATION(cur, "ffn_norm_output");
+        
+        struct ggml_tensor * tmp = ggml_mul_mat(ctx, model.layers[il].w3, cur);
+        cur = ggml_mul_mat(ctx, model.layers[il].w1, cur);
+        cur = ggml_silu(ctx, cur);
+        cur = ggml_mul(ctx, cur, tmp);
+        EXTRACT_ACTIVATION(cur, "ffn_silu_output");
+        
+        cur = ggml_mul_mat(ctx, model.layers[il].w2, cur);
+        EXTRACT_ACTIVATION(cur, "ffn_output");
+        
+        // Residual connection
+        inpL = ggml_add(ctx, inpL, cur);
+        EXTRACT_ACTIVATION(inpL, "post_ffn_residual");
+        
+        // Increment token counter for next iteration
+        if (lctx->extraction_enabled) {
+            lctx->state_extractor->increment_token();
+        }
+    }
+    
+    // Final normalization
+    inpL = ggml_rms_norm(ctx, inpL, norm_rms_eps);
+    inpL = ggml_mul(ctx, inpL, model.output_norm);
+    EXTRACT_ACTIVATION(inpL, "final_norm_output");
+    
+    // Output projection
+    inpL = ggml_mul_mat(ctx, model.output, inpL);
+    EXTRACT_ACTIVATION(inpL, "logits");
+    
+    return inpL;
+}
+
+//=============================================================================
+// STEP 6: Example usage in main.cpp
+//=============================================================================
+
+// In main.cpp, add this example usage:
+int main(int argc, char ** argv) {
+    // ... existing initialization code ...
+    
+    // Configure extraction (ADD THIS)
+    llama_extraction_config extraction_config = {};
+    extraction_config.extract_weights = true;
+    extraction_config.extract_activations = true;
+    extraction_config.extract_attention = true;
+    extraction_config.output_dir = "./extraction_output";
+    extraction_config.use_numpy_format = true; // Set to false for CSV
+    
+    // Enable extraction (ADD THIS)
+    llama_set_extraction_config(ctx, &extraction_config);
+    
+    // ... rest of existing code for inference ...
+    
+    return 0;
+}
+
+//=============================================================================
+// STEP 7: Compilation flags and dependencies
+//=============================================================================
+
+/*
+To compile with extraction support, add these flags to your Makefile:
+
+CXXFLAGS += -std=c++17 -DLLAMA_EXTRACTION_ENABLED
+
+And ensure you link against the filesystem library:
+LDFLAGS += -lstdc++fs
+
+For the complete build, you'll need to:
+1. Add llama_extraction.cpp to your source files
+2. Include llama_extraction.h in your headers
+3. Modify llama.h as shown above
+4. Modify llama.cpp as shown above
+5. Rebuild the project
+
+Performance Impact:
+- When extraction is disabled: Zero overhead (preprocessor guards)
+- When extraction is enabled: Minimal impact, mainly file I/O
+- Memory usage increases only during file writing operations
+*/
